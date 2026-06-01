@@ -1,25 +1,29 @@
 package nsq
 
 import (
-	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
+	"context"
+	"log/slog"
+
+	"github.com/roadrunner-server/api-plugins/v6/jobs"
 	"github.com/roadrunner-server/endure/v2/dep"
 	"github.com/roadrunner-server/errors"
-	"github.com/roadrunner-server/nsq/v5/nsqjobs"
+	"github.com/roadrunner-server/nsq/v6/nsqjobs"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
-	"go.uber.org/zap"
 )
+
+var _ jobs.Constructor = (*Plugin)(nil)
 
 const pluginName string = "nsq"
 
 type Configurer interface {
-	// UnmarshalKey takes a single key and unmarshal it into a Struct.
+	// UnmarshalKey takes a single key and unmarshals it into a Struct.
 	UnmarshalKey(name string, out any) error
 	// Has checks if a config section exists.
 	Has(name string) bool
 }
 
 type Logger interface {
-	NamedLogger(name string) *zap.Logger
+	NamedLogger(name string) *slog.Logger
 }
 
 type Tracer interface {
@@ -27,7 +31,7 @@ type Tracer interface {
 }
 
 type Plugin struct {
-	log    *zap.Logger
+	log    *slog.Logger
 	cfg    Configurer
 	tracer *sdktrace.TracerProvider
 }
@@ -54,12 +58,12 @@ func (p *Plugin) Collects() []*dep.In {
 	}
 }
 
-// DriverFromConfig constructs kafka driver from the .rr.yaml configuration
-func (p *Plugin) DriverFromConfig(configKey string, pq jobs.Queue, pipeline jobs.Pipeline) (jobs.Driver, error) {
-	return nsqjobs.FromConfig(p.tracer, configKey, p.log, p.cfg, pipeline, pq)
+// DriverFromConfig constructs an NSQ driver from the .rr.yaml configuration.
+func (p *Plugin) DriverFromConfig(ctx context.Context, configKey string, pq jobs.Queue, pipeline jobs.Pipeline) (jobs.Driver, error) {
+	return nsqjobs.FromConfig(ctx, p.tracer, configKey, p.log, p.cfg, pipeline, pq)
 }
 
-// DriverFromPipeline constructs kafka driver from pipeline
-func (p *Plugin) DriverFromPipeline(pipe jobs.Pipeline, pq jobs.Queue) (jobs.Driver, error) {
-	return nsqjobs.FromPipeline(p.tracer, pipe, p.log, p.cfg, pq)
+// DriverFromPipeline constructs an NSQ driver from a pipeline.
+func (p *Plugin) DriverFromPipeline(ctx context.Context, pipe jobs.Pipeline, pq jobs.Queue) (jobs.Driver, error) {
+	return nsqjobs.FromPipeline(ctx, p.tracer, pipe, p.log, p.cfg, pq)
 }

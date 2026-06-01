@@ -3,59 +3,55 @@ package nsqjobs
 import (
 	"context"
 	"encoding/json"
+	"maps"
 	"sync/atomic"
 	"time"
 
-	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
+	"github.com/google/uuid"
+	"github.com/nsqio/go-nsq"
+	"github.com/roadrunner-server/api-plugins/v6/jobs"
 	"github.com/roadrunner-server/errors"
 )
 
 var _ jobs.Job = (*Item)(nil)
 
-const (
-	auto string = "deduced_by_rr"
-)
+const auto string = "deduced_by_rr"
 
 type Item struct {
-	// Job contains the pluginName of job broker (usually PHP class).
+	// Job contains the name of the job broker (usually a PHP class).
 	Job string `json:"job"`
-	// Ident is a unique identifier of the job, should be provided from outside
+	// Ident is a unique identifier of the job, provided from the outside.
 	Ident string `json:"id"`
-	// Payload is string data (usually JSON) passed to Job broker.
+	// Payload is the string data (usually JSON) passed to the job broker.
 	Payload []byte `json:"payload"`
-	// Headers with key-values pairs
-	headers map[string][]string
-	// Options contain a set of PipelineOptions specific to job execution. Can be empty.
+	// Hdrs are the metadata key-value pairs. Exported so the item round-trips
+	// through the NSQ message body (NSQ has no broker-side header table).
+	Hdrs map[string][]string `json:"headers"`
+	// Options contains a set of options specific to job execution.
 	Options *Options `json:"options,omitempty"`
 }
 
 // Options carry information about how to handle a given job.
 type Options struct {
-	// Priority is job priority, default - 10
-	// pointer to distinguish 0 as a priority and nil as a priority not set
+	// Priority is the job priority, default - 10.
 	Priority int64 `json:"priority"`
 	// Pipeline manually specified pipeline.
 	Pipeline string `json:"pipeline,omitempty"`
-	// Delay defines time duration to delay execution for. Defaults to none.
-	Delay int `json:"delay,omitempty"`
-	// AutoAck option
+	// Delay defines the delay (in seconds) before execution. Defaults to none.
+	Delay int64 `json:"delay,omitempty"`
+	// AutoAck option.
 	AutoAck bool `json:"auto_ack"`
-	// NSQ Queue
+	// Queue is the NSQ topic the job belongs to.
 	Queue string `json:"queue,omitempty"`
 
-	// private
-	stopped *uint64
-
-	// requeueFn used as a pointer to the push function
-	requeueFn func(context.Context, *Item) error
-
-	// delayed jobs TODO(rustatian): figure out how to get stats from the DLX
-	delayed     *int64
-	multipleAck bool
-	requeue     bool
+	// private --------------------------------------------------------------
+	message   *nsq.Message
+	requeueFn func(ctx context.Context, item *Item) error
+	stopped   *atomic.Uint64
+	delayed   *atomic.Int64
 }
 
-// DelayDuration returns delay duration in the form of time.Duration.
+// DelayDuration returns the delay duration in the form of time.Duration.
 func (o *Options) DelayDuration() time.Duration {
 	return time.Second * time.Duration(o.Delay)
 }
@@ -72,231 +68,181 @@ func (i *Item) Priority() int64 {
 	return i.Options.Priority
 }
 
-// Body packs job payload into binary payload.
+// Body returns the job payload.
 func (i *Item) Body() []byte {
 	return i.Payload
 }
 
 func (i *Item) Headers() map[string][]string {
-	return i.headers
+	return i.Hdrs
 }
 
-// Context packs job context (job, id) into binary payload.
+// Context packs the job metadata into a binary payload.
 func (i *Item) Context() ([]byte, error) {
-	ctx, err := json.Marshal(
-		struct {
-			ID       string              `json:"id"`
-			Job      string              `json:"job"`
-			Driver   string              `json:"driver"`
-			Queue    string              `json:"queue"`
-			Headers  map[string][]string `json:"headers"`
-			Pipeline string              `json:"pipeline"`
-		}{
-			ID:       i.Ident,
-			Job:      i.Job,
-			Driver:   pluginName,
-			Headers:  i.headers,
-			Queue:    i.Options.Queue,
-			Pipeline: i.Options.Pipeline,
-		},
-	)
-
-	if err != nil {
-		return nil, err
-	}
-
-	return ctx, nil
+	return json.Marshal(struct {
+		ID       string              `json:"id"`
+		Job      string              `json:"job"`
+		Driver   string              `json:"driver"`
+		Queue    string              `json:"queue"`
+		Headers  map[string][]string `json:"headers"`
+		Pipeline string              `json:"pipeline"`
+	}{
+		ID:       i.Ident,
+		Job:      i.Job,
+		Driver:   pluginName,
+		Headers:  i.Hdrs,
+		Queue:    i.Options.Queue,
+		Pipeline: i.Options.Pipeline,
+	})
 }
 
 func (i *Item) Ack() error {
-	if atomic.LoadUint64(i.Options.stopped) == 1 {
+	if i.Options.stopped.Load() == 1 {
 		return errors.Str("failed to acknowledge the JOB, the pipeline is probably stopped")
 	}
-	if i.Options.Delay > 0 {
-		atomic.AddInt64(i.Options.delayed, ^int64(0))
-	}
-	// return i.Options.ack(i.Options.multipleAck)
-	return nil
-}
 
-func (i *Item) NackWithOptions(requeue bool, delay int) error {
+	if i.Options.Delay > 0 {
+		i.Options.delayed.Add(-1)
+	}
+
+	// the message was already finished in the listener
+	if i.Options.AutoAck {
+		return nil
+	}
+
+	i.Options.message.Finish()
+
 	return nil
 }
 
 func (i *Item) Nack() error {
-	if atomic.LoadUint64(i.Options.stopped) == 1 {
-		return errors.Str("failed to acknowledge the JOB, the pipeline is probably stopped")
-	}
-	if i.Options.Delay > 0 {
-		atomic.AddInt64(i.Options.delayed, ^int64(0))
+	if i.Options.stopped.Load() == 1 {
+		return errors.Str("failed to negatively acknowledge the JOB, the pipeline is probably stopped")
 	}
 
-	// return i.Options.nack(false, i.Options.requeue)
+	if i.Options.AutoAck {
+		return nil
+	}
+
+	// requeue with the server-computed (attempt-based) default delay; the job is
+	// redelivered (not terminal), so the delayed counter is left for the eventual ack.
+	i.Options.message.Requeue(-1)
+
 	return nil
 }
 
-// Requeue with the provided delay, handled by the Nack
+func (i *Item) NackWithOptions(requeue bool, delay int) error {
+	if i.Options.stopped.Load() == 1 {
+		return errors.Str("failed to negatively acknowledge the JOB, the pipeline is probably stopped")
+	}
+
+	if i.Options.AutoAck {
+		return nil
+	}
+
+	if requeue {
+		// NSQ can requeue the same payload natively, with a delay; the job is
+		// redelivered (not terminal), so leave the delayed counter for the eventual ack.
+		i.Options.message.Requeue(time.Second * time.Duration(delay))
+		return nil
+	}
+
+	// drop the message — terminal, so release its delayed slot
+	if i.Options.Delay > 0 {
+		i.Options.delayed.Add(-1)
+	}
+	i.Options.message.Finish()
+
+	return nil
+}
+
+// Requeue re-publishes the job with the provided headers/delay, then finishes
+// the original message. NSQ's native requeue cannot carry new headers, so a
+// fresh copy is published instead.
 func (i *Item) Requeue(headers map[string][]string, delay int) error {
-	if atomic.LoadUint64(i.Options.stopped) == 1 {
-		return errors.Str("failed to acknowledge the JOB, the pipeline is probably stopped")
+	if i.Options.stopped.Load() == 1 {
+		return errors.Str("failed to requeue the JOB, the pipeline is probably stopped")
 	}
+
+	// the original message is terminally finished below; release its delayed slot
+	// (the fresh copy re-increments via handleItem if it is published with a delay)
 	if i.Options.Delay > 0 {
-		atomic.AddInt64(i.Options.delayed, ^int64(0))
+		i.Options.delayed.Add(-1)
 	}
 
-	// overwrite the delay
-	i.Options.Delay = delay
-	i.headers = headers
+	if i.Options.AutoAck {
+		return nil
+	}
 
-	// err := i.Options.requeueFn(context.Background(), i)
-	// if err != nil {
-	// 	errNack := i.Options.nack(false, true)
-	// 	if errNack != nil {
-	// 		return stderr.Join(err, errNack)
-	// 	}
+	if i.Hdrs == nil {
+		i.Hdrs = make(map[string][]string, 2)
+	}
 
-	// 	return err
-	// }
+	if len(headers) > 0 {
+		maps.Copy(i.Hdrs, headers)
+	}
 
-	// // ack the job
-	// err = i.Options.ack(false)
-	// if err != nil {
-	// 	return err
-	// }
+	i.Options.Delay = int64(delay)
+
+	// publish a fresh copy; on failure keep the original in-flight for redelivery
+	if err := i.Options.requeueFn(context.Background(), i); err != nil {
+		i.Options.message.Requeue(-1)
+		return err
+	}
+
+	i.Options.message.Finish()
 
 	return nil
 }
-
-func (i *Item) Respond(_ []byte, _ string) error {
-	return nil
-}
-
-// fromDelivery converts .Delivery into an Item which will be pushed to the PQ
-// func (d *Driver) fromDelivery(deliv nsq.Delivery) *Item {
-// 	item := d.unpack(deliv)
-
-// 	switch item.Options.AutoAck {
-// 	case true:
-// 		d.log.Debug("using auto acknowledge for the job")
-// 		// stubs for ack/nack
-// 		item.Options.ack = func(bool) error {
-// 			return nil
-// 		}
-
-// 		item.Options.nack = func(bool, bool) error {
-// 			return nil
-// 		}
-// 	case false:
-// 		d.log.Debug("using driver's ack for the job")
-// 		item.Options.ack = deliv.Ack
-// 		item.Options.nack = deliv.Nack
-// 	}
-
-// 	item.Options.stopped = &d.stopped
-// 	item.Options.delayed = d.delayed
-// 	// requeue func
-// 	item.Options.requeueFn = d.handleItem
-
-// 	return item
-// }
 
 func fromJob(job jobs.Message) *Item {
 	return &Item{
 		Job:     job.Name(),
 		Ident:   job.ID(),
 		Payload: job.Payload(),
-		headers: job.Headers(),
+		Hdrs:    job.Headers(),
 		Options: &Options{
 			Priority: job.Priority(),
 			Pipeline: job.GroupID(),
-			Delay:    int(job.Delay()),
+			Delay:    job.Delay(),
 			AutoAck:  job.AutoAck(),
 		},
 	}
 }
 
-// pack job metadata into headers
-// func pack(id string, j *Item) (.Table, error) {
-// 	h, err := json.Marshal(j.headers)
-// 	if err != nil {
-// 		return nil, err
-// 	}
-// 	return .Table{
-// 		jobs.RRID:       id,
-// 		jobs.RRJob:      j.Job,
-// 		jobs.RRPipeline: j.Options.Pipeline,
-// 		jobs.RRHeaders:  h,
-// 		jobs.RRDelay:    j.Options.Delay,
-// 		jobs.RRPriority: j.Options.Priority,
-// 		jobs.RRAutoAck:  j.Options.AutoAck,
-// 	}, nil
-// }
+// unpack decodes an item from the NSQ message body and wires the broker handles.
+// Messages not produced by RoadRunner (e.g. raw publishes) are wrapped into a
+// synthetic item carrying the raw bytes as payload.
+func (d *Driver) unpack(msg *nsq.Message) *Item {
+	pipe := *d.pipeline.Load()
 
-// unpack restores jobs.Options
-// func (d *Driver) unpack(deliv .Delivery) *Item {
-// 	item := &Item{
-// 		headers: convHeaders(deliv.Headers, d.log),
-// 		Payload: deliv.Body,
-// 		Options: &Options{
-// 			Pipeline:    (*d.pipeline.Load()).Name(),
-// 			Queue:       d.queue,
-// 			requeueFn:   d.handleItem,
-// 			multipleAck: d.multipleAck,
-// 			requeue:     d.requeueOnFail,
-// 		},
-// 	}
+	item := &Item{}
+	if err := json.Unmarshal(msg.Body, item); err != nil || item.Options == nil {
+		if err != nil {
+			d.log.Debug("failed to unpack the message body, using a synthetic item", "error", err)
+		}
+		item = &Item{
+			Job:     auto,
+			Ident:   uuid.NewString(),
+			Payload: msg.Body,
+			Options: &Options{},
+		}
+	}
 
-// 	if _, ok := deliv.Headers[jobs.RRID].(string); !ok {
-// 		item.Ident = uuid.NewString()
-// 		d.log.Debug("missing header rr_id, generating new one", zap.String("assigned ID", item.Ident))
-// 	} else {
-// 		item.Ident = deliv.Headers[jobs.RRID].(string)
-// 	}
+	if item.Hdrs == nil {
+		item.Hdrs = make(map[string][]string, 2)
+	}
 
-// 	if _, ok := deliv.Headers[jobs.RRJob].(string); !ok {
-// 		item.Job = auto
-// 		d.log.Debug("missing header rr_job, using the standard one", zap.String("assigned ID", item.Job))
-// 	} else {
-// 		item.Job = deliv.Headers[jobs.RRJob].(string)
-// 	}
+	if item.Options.Priority == 0 {
+		item.Options.Priority = d.conf.Priority
+	}
 
-// 	if _, ok := deliv.Headers[jobs.RRPipeline].(string); ok {
-// 		item.Options.Pipeline = deliv.Headers[jobs.RRPipeline].(string)
-// 	}
+	item.Options.Pipeline = pipe.Name()
+	item.Options.Queue = d.conf.Topic
+	item.Options.message = msg
+	item.Options.stopped = &d.stopped
+	item.Options.delayed = &d.delayed
+	item.Options.requeueFn = d.handleItem
 
-// 	if h, ok := deliv.Headers[jobs.RRHeaders].([]byte); ok {
-// 		err := json.Unmarshal(h, &item.headers)
-// 		if err != nil {
-// 			d.log.Warn("failed to unmarshal headers (should be JSON), continuing execution", zap.Any("headers", item.headers), zap.Error(err))
-// 		}
-// 	}
-
-// 	if t, ok := deliv.Headers[jobs.RRDelay]; ok {
-// 		switch t.(type) {
-// 		case int, int16, int32, int64:
-// 			item.Options.Delay = t.(int64)
-// 		default:
-// 			d.log.Warn("unknown delay type", zap.Strings("want", []string{"int, int16, int32, int64"}), zap.Any("actual", t))
-// 		}
-// 	}
-
-// 	if t, ok := deliv.Headers[jobs.RRPriority]; !ok {
-// 		// set pipe's priority
-// 		item.Options.Priority = d.priority
-// 	} else {
-// 		switch t.(type) {
-// 		case int, int16, int32, int64:
-// 			item.Options.Priority = t.(int64)
-// 		default:
-// 			d.log.Warn("unknown priority type", zap.Strings("want", []string{"int, int16, int32, int64"}), zap.Any("actual", t))
-// 		}
-// 	}
-
-// 	if aa, ok := deliv.Headers[jobs.RRAutoAck]; ok {
-// 		if val, ok2 := aa.(bool); ok2 {
-// 			item.Options.AutoAck = val
-// 		}
-// 	}
-
-// 	return item
-// }
+	return item
+}

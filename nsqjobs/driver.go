@@ -2,56 +2,56 @@ package nsqjobs
 
 import (
 	"context"
-	"strconv"
+	"encoding/json"
+	"log/slog"
 	"sync"
 	"sync/atomic"
 	"time"
 
 	"github.com/nsqio/go-nsq"
-	"github.com/roadrunner-server/api/v4/plugins/v4/jobs"
+	"github.com/roadrunner-server/api-plugins/v6/jobs"
 	"github.com/roadrunner-server/errors"
 	jprop "go.opentelemetry.io/contrib/propagators/jaeger"
 	"go.opentelemetry.io/otel"
 	"go.opentelemetry.io/otel/propagation"
 	sdktrace "go.opentelemetry.io/otel/sdk/trace"
 	"go.opentelemetry.io/otel/trace"
-	"go.uber.org/zap"
 )
 
 const (
-	xRoutingKey        = "x-routing-key"
-	pluginName  string = "nsq"
-	tracerName  string = "jobs"
+	pluginName string = "nsq"
+	tracerName string = "jobs"
 )
 
 var _ jobs.Driver = (*Driver)(nil)
 
 type Configurer interface {
-	// UnmarshalKey takes a single key and unmarshal it into a Struct.
+	// UnmarshalKey takes a single key and unmarshals it into a Struct.
 	UnmarshalKey(name string, out any) error
 	// Has checks if a config section exists.
 	Has(name string) bool
 }
 
 type Driver struct {
-	mu       sync.RWMutex
-	log      *zap.Logger
+	mu       sync.Mutex
+	log      *slog.Logger
 	pq       jobs.Queue
 	pipeline atomic.Pointer[jobs.Pipeline]
 	tracer   *sdktrace.TracerProvider
 	prop     propagation.TextMapPropagator
 
 	// nsq
+	conf     *config
+	producer *nsq.Producer
 	consumer *nsq.Consumer
 
-	listeners uint32
-	delayed   *int64
-	stopCh    chan struct{}
-	stopped   uint64
+	listeners atomic.Uint32
+	delayed   atomic.Int64
+	stopped   atomic.Uint64
 }
 
-// FromConfig initializes NSQ pipeline
-func FromConfig(tracer *sdktrace.TracerProvider, configKey string, log *zap.Logger, cfg Configurer, pipeline jobs.Pipeline, pq jobs.Queue) (*Driver, error) {
+// FromConfig initializes an NSQ driver from the .rr.yaml configuration.
+func FromConfig(_ context.Context, tracer *sdktrace.TracerProvider, configKey string, log *slog.Logger, cfg Configurer, pipe jobs.Pipeline, pq jobs.Queue) (*Driver, error) {
 	const op = errors.Op("new_nsq_consumer")
 
 	if tracer == nil {
@@ -60,224 +60,216 @@ func FromConfig(tracer *sdktrace.TracerProvider, configKey string, log *zap.Logg
 
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}, jprop.Jaeger{})
 	otel.SetTextMapPropagator(prop)
+
 	if !cfg.Has(configKey) {
 		return nil, errors.E(op, errors.Errorf("no configuration by provided key: %s", configKey))
 	}
 
-	// if no global section
 	if !cfg.Has(pluginName) {
-		return nil, errors.E(op, errors.Str("no global nsq configuration, global configuration should contain nsq addrs"))
+		return nil, errors.E(op, errors.Str("no global nsq configuration, global configuration should contain nsq addr"))
 	}
 
-	// PARSE CONFIGURATION START -------
+	// parse the pipeline-specific section first, then overlay the global `nsq` section
 	var conf config
-	err := cfg.UnmarshalKey(configKey, &conf)
-	if err != nil {
+	if err := cfg.UnmarshalKey(configKey, &conf); err != nil {
 		return nil, errors.E(op, err)
 	}
 
-	err = cfg.UnmarshalKey(pluginName, &conf)
-	if err != nil {
+	if err := cfg.UnmarshalKey(pluginName, &conf); err != nil {
 		return nil, errors.E(op, err)
 	}
 
-	err = conf.initDefault()
-	if err != nil {
-		return nil, err
-	}
-	// PARSE CONFIGURATION END -------
-
-	ncfg := nsq.NewConfig()
-	consumer, err := nsq.NewConsumer("", "", ncfg)
-	if err != nil {
-		return nil, errors.E(op, err)
+	conf.InitDefault()
+	if conf.Topic == "" {
+		conf.Topic = pipe.Name()
 	}
 
-	err = consumer.ConnectToNSQLookupds([]string{""})
-	if err != nil {
-		return nil, errors.E(op, err)
-	}
-
-	jb := &Driver{
-		tracer: tracer,
-		prop:   prop,
-		log:    log,
-		pq:     pq,
-		stopCh: make(chan struct{}, 1),
-		// nsq
-		consumer: consumer,
-	}
-
-	jb.pipeline.Store(&pipeline)
-
-	return jb, nil
+	return newDriver(op, tracer, prop, log, pq, &conf, pipe)
 }
 
-// FromPipeline initializes consumer from pipeline
-func FromPipeline(tracer *sdktrace.TracerProvider, pipeline jobs.Pipeline, log *zap.Logger, cfg Configurer, pq jobs.Queue) (*Driver, error) {
+// FromPipeline initializes an NSQ driver from a dynamically declared pipeline.
+func FromPipeline(_ context.Context, tracer *sdktrace.TracerProvider, pipe jobs.Pipeline, log *slog.Logger, cfg Configurer, pq jobs.Queue) (*Driver, error) {
 	const op = errors.Op("new_nsq_consumer_from_pipeline")
+
 	if tracer == nil {
 		tracer = sdktrace.NewTracerProvider()
 	}
 
 	prop := propagation.NewCompositeTextMapPropagator(propagation.TraceContext{}, propagation.Baggage{}, jprop.Jaeger{})
 	otel.SetTextMapPropagator(prop)
-	// only global section
+
 	if !cfg.Has(pluginName) {
-		return nil, errors.E(op, errors.Str("no global nsq configuration, global configuration should contain nsq addrs"))
+		return nil, errors.E(op, errors.Str("no global nsq configuration, global configuration should contain nsq addr"))
 	}
 
-	// PARSE CONFIGURATION -------
+	// only the global section is unmarshalled; per-pipeline values come from the pipeline itself
 	var conf config
-	err := cfg.UnmarshalKey(pluginName, &conf)
-	if err != nil {
-		return nil, errors.E(op, err)
-	}
-	err = conf.initDefault()
-	if err != nil {
-		return nil, err
-	}
-	// PARSE CONFIGURATION -------
-
-	// parse prefetch
-	prf, err := strconv.Atoi(pipeline.String(prefetch, "10"))
-	if err != nil {
-		log.Error("prefetch parse, driver will use default (10) prefetch", zap.String("prefetch", pipeline.String(prefetch, "10")))
-	}
-
-	_ = prf
-
-	ncfg := nsq.NewConfig()
-	consumer, err := nsq.NewConsumer("", "", ncfg)
-	if err != nil {
+	if err := cfg.UnmarshalKey(pluginName, &conf); err != nil {
 		return nil, errors.E(op, err)
 	}
 
-	err = consumer.ConnectToNSQLookupds([]string{""})
+	conf.Topic = pipe.String(topicKey, pipe.Name())
+	conf.Channel = pipe.String(channelKey, "")
+	conf.Prefetch = pipe.Int(prefetchKey, 10)
+	conf.Priority = pipe.Priority()
+	conf.MaxAttempts = uint16(pipe.Int(maxAttemptsKey, 0)) //nolint:gosec
+
+	conf.InitDefault()
+
+	return newDriver(op, tracer, prop, log, pq, &conf, pipe)
+}
+
+// newDriver builds the driver and its nsqd producer. The consumer is created
+// lazily in Run/Resume, once the topic and channel are known.
+func newDriver(op errors.Op, tracer *sdktrace.TracerProvider, prop propagation.TextMapPropagator, log *slog.Logger, pq jobs.Queue, conf *config, pipe jobs.Pipeline) (*Driver, error) {
+	producer, err := nsq.NewProducer(conf.Addr, conf.nsqConfig())
 	if err != nil {
 		return nil, errors.E(op, err)
 	}
+	producer.SetLogger(&nsqLogger{log: log}, nsq.LogLevelWarning)
 
-	jb := &Driver{
-		prop:    prop,
-		tracer:  tracer,
-		log:     log,
-		pq:      pq,
-		stopCh:  make(chan struct{}, 1),
-		delayed: ptrTo(int64(0)),
+	// fail fast if nsqd is unreachable
+	if err := producer.Ping(); err != nil {
+		producer.Stop()
+		return nil, errors.E(op, err)
 	}
 
-	return jb, nil
+	d := &Driver{
+		log:      log,
+		pq:       pq,
+		tracer:   tracer,
+		prop:     prop,
+		conf:     conf,
+		producer: producer,
+	}
+	d.pipeline.Store(&pipe)
+
+	return d, nil
 }
 
 func (d *Driver) Push(ctx context.Context, job jobs.Message) error {
 	const op = errors.Op("nsq_driver_push")
-	// check if the pipeline registered
 
 	ctx, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "nsq_push")
 	defer span.End()
 
-	// load atomic value
 	pipe := *d.pipeline.Load()
 	if pipe.Name() != job.GroupID() {
 		return errors.E(op, errors.Errorf("no such pipeline: %s, actual: %s", job.GroupID(), pipe.Name()))
 	}
 
-	// err := d.handleItem(ctx, fromJob(job))
-	// if err != nil {
-	// 	return errors.E(op, err)
-	// }
+	if err := d.handleItem(ctx, fromJob(job)); err != nil {
+		return errors.E(op, err)
+	}
 
 	return nil
 }
 
 func (d *Driver) Run(ctx context.Context, p jobs.Pipeline) error {
-	start := time.Now().UTC()
 	const op = errors.Op("nsq_driver_run")
+	start := time.Now().UTC()
 
 	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "nsq_run")
 	defer span.End()
 
 	pipe := *d.pipeline.Load()
 	if pipe.Name() != p.Name() {
-		return errors.E(op, errors.Errorf("no such pipeline registered: %s", pipe.Name()))
+		return errors.E(op, errors.Errorf("no such pipeline registered: %s, actual: %s", p.Name(), pipe.Name()))
 	}
 
-	// if d.queue == "" {
-	// 	return errors.Str("empty queue name, consider adding the queue name to the NSQ configuration")
-	// }
-
-	// protect connection (redial)
 	d.mu.Lock()
 	defer d.mu.Unlock()
 
-	// declare/bind/check the queue
+	if err := d.startConsumer(); err != nil {
+		return errors.E(op, err)
+	}
+	d.listeners.Store(1)
 
-	atomic.StoreUint32(&d.listeners, 1)
-	d.log.Debug("pipeline was started", zap.String("driver", pipe.Driver()), zap.String("pipeline", pipe.Name()), zap.Time("start", start), zap.Int64("elapsed", time.Since(start).Milliseconds()))
+	d.log.Debug("pipeline was started",
+		"driver", pipe.Driver(), "pipeline", pipe.Name(), "topic", d.conf.Topic, "channel", d.conf.Channel,
+		"start", start, "elapsed", time.Since(start))
+
 	return nil
-}
-
-func (d *Driver) State(ctx context.Context) (*jobs.State, error) {
-	const op = errors.Op("nsq_driver_state")
-	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "nsq_state")
-	defer span.End()
-
-	return nil, nil
 }
 
 func (d *Driver) Pause(ctx context.Context, p string) error {
 	start := time.Now().UTC()
-	pipe := *d.pipeline.Load()
-
-	// todo
-	_ = start
 
 	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "nsq_pause")
 	defer span.End()
 
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	pipe := *d.pipeline.Load()
 	if pipe.Name() != p {
 		return errors.Errorf("no such pipeline: %s", pipe.Name())
 	}
 
-	// no active listeners
-	if atomic.LoadUint32(&d.listeners) == 0 {
+	if d.listeners.Load() == 0 {
 		return errors.Str("no active listeners, nothing to pause")
 	}
 
-	atomic.AddUint32(&d.listeners, ^uint32(0))
+	if d.consumer == nil {
+		return errors.Str("no active consumer, nothing to pause")
+	}
 
-	// protect connection (redial)
-	d.mu.Lock()
-	defer d.mu.Unlock()
+	// stop delivery without tearing the connection down
+	d.consumer.ChangeMaxInFlight(0)
+	d.listeners.Store(0)
+
+	d.log.Debug("pipeline was paused",
+		"driver", pipe.Driver(), "pipeline", pipe.Name(), "start", start, "elapsed", time.Since(start))
 
 	return nil
 }
 
 func (d *Driver) Resume(ctx context.Context, p string) error {
+	const op = errors.Op("nsq_driver_resume")
 	start := time.Now().UTC()
-
-	//todo
-	_ = start
 
 	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "nsq_resume")
 	defer span.End()
+
+	d.mu.Lock()
+	defer d.mu.Unlock()
 
 	pipe := *d.pipeline.Load()
 	if pipe.Name() != p {
 		return errors.Errorf("no such pipeline: %s", pipe.Name())
 	}
 
-	// protect connection (redial)
-	d.mu.Lock()
-	defer d.mu.Unlock()
-
-	// no active listeners
-	if atomic.LoadUint32(&d.listeners) == 1 {
+	if d.listeners.Load() == 1 {
 		return errors.Str("nsq listener is already in the active state")
 	}
 
+	if err := d.startConsumer(); err != nil {
+		return errors.E(op, err)
+	}
+	d.listeners.Store(1)
+
+	d.log.Debug("pipeline was resumed",
+		"driver", pipe.Driver(), "pipeline", pipe.Name(), "start", start, "elapsed", time.Since(start))
+
 	return nil
+}
+
+func (d *Driver) State(ctx context.Context) (*jobs.State, error) {
+	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "nsq_state")
+	defer span.End()
+
+	pipe := *d.pipeline.Load()
+
+	// NSQ's Go client exposes no per-channel stats, so (like the Kafka and Pub/Sub
+	// drivers) we report identity + readiness, plus a locally tracked delayed count.
+	return &jobs.State{
+		Priority: uint64(d.conf.Priority), //nolint:gosec
+		Pipeline: pipe.Name(),
+		Driver:   pipe.Driver(),
+		Queue:    d.conf.Topic,
+		Delayed:  d.delayed.Load(),
+		Ready:    ready(d.listeners.Load()),
+	}, nil
 }
 
 func (d *Driver) Stop(ctx context.Context) error {
@@ -286,18 +278,93 @@ func (d *Driver) Stop(ctx context.Context) error {
 	_, span := trace.SpanFromContext(ctx).TracerProvider().Tracer(tracerName).Start(ctx, "nsq_stop")
 	defer span.End()
 
-	atomic.StoreUint64(&d.stopped, 1)
-	d.stopCh <- struct{}{}
+	d.mu.Lock()
+	defer d.mu.Unlock()
+
+	// Drain BEFORE flagging the driver stopped: in-flight messages are finished by
+	// the worker via Item.Ack/Nack, which short-circuit once stopped == 1. Flipping
+	// the flag first would block those acks and stall consumer.Stop() until go-nsq's
+	// force-exit timeout fires.
+	if d.consumer != nil {
+		d.consumer.Stop()
+		<-d.consumer.StopChan // wait for in-flight handlers to drain
+		d.consumer = nil
+	}
+
+	d.stopped.Store(1)
+
+	if d.producer != nil {
+		d.producer.Stop()
+	}
 
 	pipe := *d.pipeline.Load()
-	d.log.Debug("pipeline was stopped", zap.String("driver", pipe.Driver()), zap.String("pipeline", pipe.Name()), zap.Time("start", start), zap.Int64("elapsed", time.Since(start).Milliseconds()))
+	_ = d.pq.Remove(pipe.Name())
+
+	d.log.Debug("pipeline was stopped",
+		"driver", pipe.Driver(), "pipeline", pipe.Name(), "start", start, "elapsed", time.Since(start))
 
 	return nil
 }
 
-// handleItem
-func (d *Driver) handleItem(ctx context.Context, msg *Item) error {
+// startConsumer lazily creates and connects the consumer the first time it is
+// needed; subsequent calls simply re-enable delivery. Callers must hold d.mu.
+func (d *Driver) startConsumer() error {
+	if d.consumer != nil {
+		d.consumer.ChangeMaxInFlight(d.conf.Prefetch)
+		return nil
+	}
+
+	consumer, err := nsq.NewConsumer(d.conf.Topic, d.conf.Channel, d.conf.nsqConfig())
+	if err != nil {
+		return err
+	}
+	consumer.SetLogger(&nsqLogger{log: d.log}, nsq.LogLevelWarning)
+	consumer.AddConcurrentHandlers(&Listener{driver: d}, d.conf.Prefetch)
+
+	if len(d.conf.Lookupd) > 0 {
+		err = consumer.ConnectToNSQLookupds(d.conf.Lookupd)
+	} else {
+		err = consumer.ConnectToNSQD(d.conf.Addr)
+	}
+	if err != nil {
+		consumer.Stop()
+		return err
+	}
+
+	d.consumer = consumer
+
+	return nil
+}
+
+// handleItem serializes the whole item into the message body (NSQ has no broker
+// header table) and publishes it, deferring the delivery when a delay is set.
+func (d *Driver) handleItem(ctx context.Context, item *Item) error {
 	const op = errors.Op("nsq_driver_handle_item")
+
+	if item.Hdrs == nil {
+		item.Hdrs = make(map[string][]string, 2)
+	}
+
+	// carry the trace context with the message
+	d.prop.Inject(ctx, propagation.HeaderCarrier(item.Hdrs))
+
+	body, err := json.Marshal(item)
+	if err != nil {
+		return errors.E(op, err)
+	}
+
+	if delay := item.Options.DelayDuration(); delay > 0 {
+		d.delayed.Add(1)
+		if err := d.producer.DeferredPublish(d.conf.Topic, delay, body); err != nil {
+			d.delayed.Add(-1)
+			return errors.E(op, err)
+		}
+		return nil
+	}
+
+	if err := d.producer.Publish(d.conf.Topic, body); err != nil {
+		return errors.E(op, err)
+	}
 
 	return nil
 }
@@ -306,6 +373,12 @@ func ready(r uint32) bool {
 	return r > 0
 }
 
-func ptrTo[T any](val T) *T {
-	return &val
+// nsqLogger adapts the go-nsq logger interface to the structured logger.
+type nsqLogger struct {
+	log *slog.Logger
+}
+
+func (l *nsqLogger) Output(_ int, s string) error {
+	l.log.Debug(s)
+	return nil
 }

@@ -12,17 +12,17 @@ on:
 
 jobs:
   nsq_test:
-    name: RabbitMQ plugin (Go ${{ matrix.go }}, PHP ${{ matrix.php }}, OS ${{matrix.os}})
+    name: NSQ plugin (Go ${{ matrix.go }}, PHP ${{ matrix.php }}, OS ${{matrix.os}})
     runs-on: ${{ matrix.os }}
     timeout-minutes: 60
     strategy:
       matrix:
-        php: ["8.3"]
+        php: ["8.5"]
         go: [stable]
         os: ["ubuntu-latest"]
     steps:
       - name: Set up Go ${{ matrix.go }}
-        uses: actions/setup-go@v5 # action page: <https://github.com/actions/setup-go>
+        uses: actions/setup-go@v6 # action page: <https://github.com/actions/setup-go>
         with:
           go-version: ${{ matrix.go }}
 
@@ -33,7 +33,7 @@ jobs:
           extensions: sockets
 
       - name: Check out code
-        uses: actions/checkout@v4
+        uses: actions/checkout@v6
 
       - name: Get Composer Cache Directory
         id: composer-cache
@@ -42,7 +42,7 @@ jobs:
           echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
 
       - name: Init Composer Cache # Docs: <https://git.io/JfAKn#php---composer>
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ${{ steps.composer-cache.outputs.dir }}
           key: ${{ runner.os }}-composer-${{ matrix.php }}-${{ hashFiles('**/composer.json') }}
@@ -52,7 +52,7 @@ jobs:
         run: cd tests/php_test_files && composer update --prefer-dist --no-progress --ansi
 
       - name: Init Go modules Cache # Docs: <https://git.io/JfAKn#go---modules>
-        uses: actions/cache@v4
+        uses: actions/cache@v5
         with:
           path: ~/go/pkg/mod
           key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
@@ -64,47 +64,104 @@ jobs:
       - name: Run golang tests with coverage
         run: |
           cd tests
-          sudo apt update
-          sudo apt install -y libnss3-tools
-          curl -JLO "https://dl.filippo.io/mkcert/latest?for=linux/amd64"
-          chmod +x mkcert-v*-linux-amd64
-          sudo cp mkcert-v*-linux-amd64 /usr/local/bin/mkcert
-          mkcert -install
-          mkcert localhost 127.0.0.1 ::1
-          mkcert -client localhost 127.0.0.1 ::1
-          cp -r localhost+2-client-key.pem localhost+2-client.pem localhost+2-key.pem localhost+2.pem test-certs/
-          cp -r $(mkcert -CAROOT)/rootCA.pem test-certs/
-
           docker compose -f env/docker-compose.yaml up -d
           sleep 30
-
           mkdir ./coverage-ci
-          go test -timeout 20m -v -race -cover -tags=debug -failfast -coverpkg=$(cat pkgs.txt) -coverprofile=./coverage-ci/nsq.out -covermode=atomic jobs_nsq_test.go
-          docker compose -f env/docker-compose-nsq.yaml down
+          go test -timeout 20m -v -race -cover -tags=debug -failfast -coverpkg=github.com/roadrunner-server/nsq/v6/... -coverprofile=./coverage-ci/nsq.out -covermode=atomic jobs_nsq_test.go
+          docker compose -f env/docker-compose.yaml down
 
-      - name: Archive code coverage results
-        uses: actions/upload-artifact@v4
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
         with:
-          name: coverage
+          name: coverage-nsq
           path: ./tests/coverage-ci/nsq.out
 
-  codecov:
-    name: Upload codecov
-    runs-on: ubuntu-latest
-    needs:
-      - nsq_test
-
+  nsq_durability:
+    name: NSQ durability plugin (Go ${{ matrix.go }}, PHP ${{ matrix.php }}, OS ${{matrix.os}})
+    runs-on: ${{ matrix.os }}
     timeout-minutes: 60
+    strategy:
+      matrix:
+        php: ["8.5"]
+        go: [stable]
+        os: ["ubuntu-latest"]
     steps:
-      - name: Download code coverage results
-        uses: actions/download-artifact@v4
-      - run: |
-          echo 'mode: atomic' > summary.txt
-          tail -q -n +2 *.out >> summary.txt
-          sed -i '2,${/roadrunner/!d}' summary.txt
-
-      - name: upload to codecov
-        uses: codecov/codecov-action@v4 # Docs: <https://github.com/codecov/codecov-action>
+      - name: Set up Go ${{ matrix.go }}
+        uses: actions/setup-go@v6 # action page: <https://github.com/actions/setup-go>
         with:
-          file: summary.txt
+          go-version: ${{ matrix.go }}
+
+      - name: Set up PHP ${{ matrix.php }}
+        uses: shivammathur/setup-php@v2 # action page: <https://github.com/shivammathur/setup-php>
+        with:
+          php-version: ${{ matrix.php }}
+          extensions: sockets
+
+      - name: Check out code
+        uses: actions/checkout@v6
+
+      - name: Get Composer Cache Directory
+        id: composer-cache
+        run: |
+          cd tests/php_test_files
+          echo "dir=$(composer config cache-files-dir)" >> $GITHUB_OUTPUT
+
+      - name: Init Composer Cache # Docs: <https://git.io/JfAKn#php---composer>
+        uses: actions/cache@v5
+        with:
+          path: ${{ steps.composer-cache.outputs.dir }}
+          key: ${{ runner.os }}-composer-${{ matrix.php }}-${{ hashFiles('**/composer.json') }}
+          restore-keys: ${{ runner.os }}-composer-
+
+      - name: Install Composer dependencies
+        run: cd tests/php_test_files && composer update --prefer-dist --no-progress --ansi
+
+      - name: Init Go modules Cache # Docs: <https://git.io/JfAKn#go---modules>
+        uses: actions/cache@v5
+        with:
+          path: ~/go/pkg/mod
+          key: ${{ runner.os }}-go-${{ hashFiles('**/go.sum') }}
+          restore-keys: ${{ runner.os }}-go-
+
+      - name: Install Go dependencies
+        run: go mod download
+
+      - name: Run golang tests with coverage
+        run: |
+          cd tests
+          docker compose -f env/docker-compose.yaml up -d
+          sleep 30
+          mkdir ./coverage-ci
+          # No -race here: go-nsq's Producer has an internal data race in its reconnect path
+          # (triggered only on redial). The test is functionally correct; the non-durability
+          # suite runs under -race.
+          go test -timeout 20m -v -cover -tags=debug -failfast -coverpkg=github.com/roadrunner-server/nsq/v6/... -coverprofile=./coverage-ci/durability.out -covermode=atomic jobs_nsq_durability_test.go
+          docker compose -f env/docker-compose.yaml down
+
+      - name: Upload coverage artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: coverage-durability
+          path: ./tests/coverage-ci/durability.out
+
+  codecov:
+    name: Upload coverage to Codecov
+    runs-on: ubuntu-latest
+    needs: [nsq_test, nsq_durability]
+    steps:
+      - name: Download all coverage artifacts
+        uses: actions/download-artifact@v8
+        with:
+          pattern: coverage-*
+          merge-multiple: true
+
+      - name: Merge coverage files
+        run: |
+          echo "mode: atomic" > summary.txt
+          cat *.out | grep -v "^mode:" | awk '{ sub(/github\.com\/roadrunner-server\/nsq\/v[56]\//, ""); print }' >> summary.txt
+
+      - name: Upload to codecov
+        uses: codecov/codecov-action@v6 # Docs: <https://github.com/codecov/codecov-action>
+        with:
+          files: summary.txt
           fail_ci_if_error: false

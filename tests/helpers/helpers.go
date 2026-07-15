@@ -115,7 +115,6 @@ func Stats(address string, state *jobState.State) func(t *testing.T) {
 		resp := &jobsProto.Stats{}
 		err := client.Call("jobs.GetStats", &emptypb.Empty{}, resp)
 		require.NoError(t, err)
-		require.NotNil(t, resp)
 		require.NotEmpty(t, resp.GetStats())
 
 		st := resp.GetStats()[0]

@@ -37,6 +37,10 @@ type config struct {
 	ReadTimeout time.Duration `mapstructure:"read_timeout"`
 	// WriteTimeout is the network write timeout.
 	WriteTimeout time.Duration `mapstructure:"write_timeout"`
+	// LookupdPollInterval is how often the consumer polls nsqlookupd. go-nsq
+	// also uses it as the delay before re-dialing a dropped nsqd connection, so
+	// it bounds how long a pipeline stays down after a broker blip.
+	LookupdPollInterval time.Duration `mapstructure:"lookupd_poll_interval"`
 
 	// local -------------------------------------------------------------
 
@@ -93,6 +97,10 @@ func (c *config) nsqConfig() *nsq.Config {
 
 	if c.WriteTimeout > 0 {
 		ncfg.WriteTimeout = c.WriteTimeout
+	}
+
+	if c.LookupdPollInterval > 0 {
+		ncfg.LookupdPollInterval = c.LookupdPollInterval
 	}
 
 	if c.MaxAttempts > 0 {

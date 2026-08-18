@@ -1,29 +1,39 @@
 services:
+  # nsqlookupd is only used by the discovery test; the rest of the suite dials nsqd directly
   nsqlookupd:
-    image: nsqio/nsq
+    image: nsqio/nsq:v1.3.0
     command: /nsqlookupd
     ports:
-      - "4160:4160"
-      - "4161:4161"
+      - "127.0.0.1:4160:4160"
+      - "127.0.0.1:4161:4161"
+    healthcheck:
+      test: ["CMD", "/nsqlookupd", "--version"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
   nsqd:
-    image: nsqio/nsq
+    image: nsqio/nsq:v1.3.0
     command: /nsqd --lookupd-tcp-address=nsqlookupd:4160 --broadcast-address=127.0.0.1
     depends_on:
-      - nsqlookupd
+      nsqlookupd:
+        condition: service_healthy
     ports:
-      - "4150:4150"
-      - "4151:4151"
+      - "127.0.0.1:4150:4150"
+      - "127.0.0.1:4151:4151"
+    healthcheck:
+      test: ["CMD", "wget", "-qO-", "http://127.0.0.1:4151/ping"]
+      interval: 2s
+      timeout: 2s
+      retries: 30
 
-  nsqadmin:
-    image: nsqio/nsq
-    command: /nsqadmin --lookupd-http-address=nsqlookupd:4161
-    depends_on:
-      - nsqlookupd
-    ports:
-      - "4171:4171"
-
-  # used by the durability (redial) test
+  # fronts nsqd for the durability (redial) test; bridged rather than host
+  # networked so the api and the proxied port are reachable off Linux too
   toxiproxy:
-    image: ghcr.io/shopify/toxiproxy:latest
-    network_mode: "host"
+    image: ghcr.io/shopify/toxiproxy:2.12.0
+    depends_on:
+      nsqd:
+        condition: service_healthy
+    ports:
+      - "127.0.0.1:8474:8474"
+      - "127.0.0.1:4155:4155"

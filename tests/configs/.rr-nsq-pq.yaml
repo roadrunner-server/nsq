@@ -22,7 +22,8 @@ jobs:
   pool:
     num_workers: 2
     allocate_timeout: 60s
-    destroy_timeout: 100s
+    # the workers outlive the destroy on purpose, so cap the wait
+    destroy_timeout: 5s
 
   pipelines:
     test-1-pq:
@@ -31,7 +32,7 @@ jobs:
         topic: rr-pq-1
         channel: default
         priority: 11
-        prefetch: 10
+        prefetch: 5
 
     test-2-pq:
       driver: nsq
@@ -39,7 +40,7 @@ jobs:
         topic: rr-pq-2
         channel: default
         priority: 11
-        prefetch: 10
+        prefetch: 5
 
   # list of pipelines to be consumed by the server, keep empty if you want to start consuming manually
   consume: [ "test-1-pq", "test-2-pq" ]

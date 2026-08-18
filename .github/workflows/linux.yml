@@ -61,20 +61,25 @@ jobs:
       - name: Install Go dependencies
         run: go mod download
 
+      - name: Run unit tests with coverage
+        run: |
+          mkdir ./tests/coverage-ci
+          go test -timeout 5m -v -race -cover -tags=debug -coverpkg=./... -coverprofile=./tests/coverage-ci/nsq_u.out -covermode=atomic ./...
+
+      - name: Start the broker
+        run: docker compose -f tests/env/docker-compose.yaml up -d --wait
+
       - name: Run golang tests with coverage
         run: |
           cd tests
-          docker compose -f env/docker-compose.yaml up -d
-          sleep 30
-          mkdir ./coverage-ci
-          go test -timeout 20m -v -race -cover -tags=debug -failfast -coverpkg=github.com/roadrunner-server/nsq/v6/... -coverprofile=./coverage-ci/nsq.out -covermode=atomic jobs_nsq_test.go
-          docker compose -f env/docker-compose.yaml down
+          mkdir -p ./coverage-ci
+          go test -timeout 20m -v -race -cover -tags=debug -coverpkg=github.com/roadrunner-server/nsq/v6/... -coverprofile=./coverage-ci/nsq.out -covermode=atomic ./...
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7
         with:
           name: coverage-nsq
-          path: ./tests/coverage-ci/nsq.out
+          path: ./tests/coverage-ci/
 
   nsq_durability:
     name: NSQ durability plugin (Go ${{ matrix.go }}, PHP ${{ matrix.php }}, OS ${{matrix.os}})
@@ -126,17 +131,16 @@ jobs:
       - name: Install Go dependencies
         run: go mod download
 
+      - name: Start the broker
+        run: docker compose -f tests/env/docker-compose.yaml up -d --wait
+
       - name: Run golang tests with coverage
         run: |
           cd tests
-          docker compose -f env/docker-compose.yaml up -d
-          sleep 30
           mkdir ./coverage-ci
-          # No -race here: go-nsq's Producer has an internal data race in its reconnect path
-          # (triggered only on redial). The test is functionally correct; the non-durability
-          # suite runs under -race.
-          go test -timeout 20m -v -cover -tags=debug -failfast -coverpkg=github.com/roadrunner-server/nsq/v6/... -coverprofile=./coverage-ci/durability.out -covermode=atomic jobs_nsq_durability_test.go
-          docker compose -f env/docker-compose.yaml down
+          # no -race here: go-nsq's Producer races with itself on the reconnect path,
+          # which only this test reaches. The rest of the suite runs under -race.
+          go test -timeout 20m -v -cover -tags=debug -run TestRedialAfterOutage -coverpkg=github.com/roadrunner-server/nsq/v6/... -coverprofile=./coverage-ci/durability.out -covermode=atomic ./...
 
       - name: Upload coverage artifact
         uses: actions/upload-artifact@v7

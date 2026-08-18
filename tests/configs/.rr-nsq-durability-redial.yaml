@@ -9,8 +9,11 @@ server:
   relay_timeout: "20s"
 
 nsq:
-  # nsqd is fronted by toxiproxy (127.0.0.1:4155 -> 127.0.0.1:4150)
+  # nsqd is fronted by toxiproxy (127.0.0.1:4155 -> nsqd:4150)
   addr: tcp://127.0.0.1:4155
+  # go-nsq waits this long before re-dialing a dropped connection; the 60s
+  # default would put the whole test behind one reconnect
+  lookupd_poll_interval: 1s
 
 logs:
   level: error

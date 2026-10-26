@@ -42,7 +42,7 @@ require (
 	github.com/prometheus/client_golang v1.25.0 // indirect
 	github.com/prometheus/client_model v0.6.3 // indirect
 	github.com/prometheus/common v0.72.1 // indirect
-	github.com/prometheus/procfs v0.22.0 // indirect
+	github.com/prometheus/procfs v0.23.0 // indirect
 	github.com/roadrunner-server/errors v1.6.0 // indirect
 	github.com/roadrunner-server/events v1.1.0 // indirect
 	github.com/roadrunner-server/pool/v2 v2.0.0 // indirect

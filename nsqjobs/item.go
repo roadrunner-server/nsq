@@ -2,7 +2,7 @@ package nsqjobs
 
 import (
 	"context"
-	"encoding/json"
+	"encoding/json/v2"
 	"maps"
 	"sync/atomic"
 	"time"

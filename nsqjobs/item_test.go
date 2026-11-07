@@ -1,7 +1,7 @@
 package nsqjobs
 
 import (
-	"encoding/json"
+	"encoding/json/v2"
 	"log/slog"
 	"sync/atomic"
 	"testing"
